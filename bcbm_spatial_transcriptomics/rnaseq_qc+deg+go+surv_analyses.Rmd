@@ -1,0 +1,840 @@
+```{r}
+# clear workspace variables
+rm(list = ls())
+cat("\014")
+# close all plots
+graphics.off()
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(openxlsx)
+library(DESeq2)
+library(vsn)
+library(pheatmap)
+library(EnhancedVolcano)
+library(tidyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(pheatmap)
+library(tibble)
+library(scales)
+```
+#LOAD DATA
+```{r}
+workingdir="" #path where CSF-Seq_Project_10.04.2024 is located 
+rawcount=read.xlsx(paste0(workingdir,"/CSF-Seq_Project_10.04.2024/Data\ Files\ Updated\ _\ 10.29.24/CSF.Seq_Counts.xlsx"))
+metall=data.frame(readxl::read_excel(paste0(workingdir,"/CSF-Seq_Project_10.04.2024/Data\ Files\ Updated\ _\ 10.29.24/CSF.Seq_Metadata.xlsx")))
+rownames(metall)=metall$Sample.ID_2
+library(biomaRt)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+protein_coding_genes <- getBM(
+    attributes = c("hgnc_symbol", "ensembl_gene_id"), # HGNC symbols and Ensembl gene IDs
+    filters = "biotype",
+    values = "protein_coding", # Filter for protein-coding genes
+    mart = ensembl
+)
+#table(protein_coding_genes)
+unique(protein_coding_genes$hgnc_symbol) #19466 unique protein coding genes
+table(rowSums(rawcount[rawcount$gene %in% protein_coding_genes$hgnc_symbol,-1])>0)
+rawcount=rawcount[rowSums(rawcount[,-1])>0 & rawcount$gene %in% protein_coding_genes$hgnc_symbol,]
+```
+
+#Figure 3H TIMECOURSE DATA
+```{r}
+metalong=metall[!is.na(metall$Longitudinal),]
+countlong=rawcount[,c("gene",colnames(rawcount)[colnames(rawcount) %in% metalong$Sample.ID_2])]
+rownames(countlong)=countlong$gene
+countlong=countlong[,-1]
+countlong=countlong[rowSums(countlong)>0,]
+
+#USE ONLY TBI FOR LONGITUDINAL ANALYSES, BECAUSE GBM AND BREAST_LMD SAMPLE SIZE IS TOO LOW (N=2 per group)
+metalong2=metalong[metalong$TBI.Day %in% c(1,3) & metalong$Group=="TBI",] %>%
+  mutate(timef=factor(ifelse(TBI.Day==1,"Baseline","FU")),ptid=factor(gsub(" ","",Patient.ID)))
+countlong2=countlong[,metalong2$Sample.ID_2]
+all(metalong2$Sample.ID_2 == colnames(countlong2))
+dds=DESeqDataSetFromMatrix(countData = countlong2[,metalong2$Sample.ID_2[metalong2$Group=="TBI"]],
+                              colData = metalong2[metalong2$Group=="TBI",],
+                              design = ~ ptid+timef)
+
+dds=DESeq(dds)
+resdds=results(dds)
+resdds_df=as.data.frame(resdds)
+resdds_df$significant <- ifelse(resdds_df$padj < 0.05, "Significant", "Not Significant")
+EnhancedVolcano(resdds,lab = rownames(resdds),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+
+
+countlong_wide=data.frame(t(as.matrix(countlong))+0.5) #as in DESeq2, add 0.5 for for log2FC calculation to avoid zeroes.
+countlong_wide$Sample.ID_2=rownames(countlong_wide)
+countlong_log2fc=merge(metalong[metalong$Group=="TBI",c("Sample.ID_2","Patient.ID","TBI.Day")],countlong_wide) %>%
+  pivot_longer(cols = gsub("-",".",rownames(countlong)), names_to = "gene", values_to = "Value") %>%
+  group_by(Patient.ID, gene) %>%
+  mutate(Base = Value[TBI.Day == 1]) %>%
+  mutate(Log2FC = log2(Value / Base)) %>%
+  ungroup() %>%
+  dplyr::select(-Base) # Remove the baseline column if not needed
+countlong_log2fc$idtp=paste(countlong_log2fc$Patient.ID,countlong_log2fc$TBI.Day,sep="_")
+
+ggplot(countlong_log2fc[countlong_log2fc$Patient.ID%in%metalong2$Patient.ID[metalong2$Group=="TBI"] & countlong_log2fc$gene %in% rownames(resdds_df[resdds_df$significant=="Significant",]),], aes(x=as.numeric(`TBI.Day`)-1, y=Log2FC,color=gene)) + #geom_point(size=4, shape=1,aes(color=Patient.ID))+
+  theme_bw()+geom_smooth(alpha = 0.1,aes(fill = gene))+labs(color = "DEGs",fill="DEGs")+xlab("Time (Days)")
+```
+#Figure 6: Method Reproducibility (A-C)
+```{r}
+#RT vs ICE (only subject TBI9, repeated at multiple post-TBI day (1,2,3,7))
+countrtice=rawcount[,metall$Sample.ID_2[
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$Patient.ID %in% unique(subset(metall,TBI.Condition=="Ice_30min")["Patient.ID"])]) &  
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Day %in% pull(unique(subset(metall,TBI.Condition=="Ice_30min")["TBI.Day"]))]) &
+  (metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Condition!="RT_60min"])
+  ]]
+rownames(countrtice)=rawcount$gene
+
+metartice=data.frame(metall[metall$Sample.ID_2 %in% colnames(countrtice),])
+rownames(metartice)=metartice$Sample.ID_2
+  
+rtice <- DESeqDataSetFromMatrix(countData = countrtice,
+                          colData = metartice,
+                          design = ~ TBI.Day+TBI.Condition )
+rtice=DESeq(rtice)
+resrtice=results(rtice)
+resrtice_df=as.data.frame(resrtice)
+resrtice_df$significant <- ifelse(resrtice_df$padj < 0.05, "Significant", "Not Significant")
+ggplot(resrtice_df, aes(x=log2FoldChange, y=-log10(pvalue))) +geom_point(alpha=0.5) +scale_color_manual(values=c("red", "black")) +theme_minimal() +labs(title="Volcano Plot",x="Log2 Fold Change",y="-Log10 p-value") +theme(legend.title=element_blank())
+EnhancedVolcano(resrtice,lab = rownames(resrtice),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+#heatmap
+heatmap_rtice=t(apply(countrtice[rownames(countrtice) %in% rownames(resrtice_df[order(-abs(resrtice_df$log2FoldChange)), ][1:100, ]),],1,scale))
+colnames(heatmap_rtice)=colnames(countrtice)
+pheatmap(heatmap_rtice,annotation_col = metartice[,c("TBI.Condition","TBI.Day")],cluster_cols = FALSE,show_colnames = F)
+
+
+
+#RT 30 vs 60 minutes (only subject TBI9, repeated at multiple post-TBI day (1,2,3,7))
+countrtmin=rawcount[,metall$Sample.ID_2[
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$Patient.ID %in% pull(unique(subset(metall,TBI.Condition=="RT_60min")["Patient.ID"]))]) &  
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Day %in% pull(unique(subset(metall,TBI.Condition=="RT_60min")["TBI.Day"]))]) &
+  (metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Condition!="Ice_30min"])
+  ]]
+rownames(countrtmin)=rawcount$gene
+
+metartmin=data.frame(metall[metall$Sample.ID_2 %in% colnames(countrtmin),])
+rownames(metartmin)=metartmin$Sample.ID_2
+metartmin$idtp=paste(metartmin$Patient.ID,metartmin$TBI.Day,sep="_")
+  
+rtmin <- DESeqDataSetFromMatrix(countData = countrtmin,
+                          colData = metartmin,
+                          design = ~ idtp+TBI.Condition )
+rtmin=DESeq(rtmin)
+resrtmin=results(rtmin)
+resrtmin_df=as.data.frame(resrtmin)
+resrtmin_df$significant <- ifelse(resrtmin_df$padj < 0.05, "Significant", "Not Significant")
+ggplot(resrtmin_df, aes(x=log2FoldChange, y=-log10(pvalue))) +geom_point(alpha=0.5) +scale_color_manual(values=c("red", "black")) +theme_minimal() +labs(title="Volcano Plot",x="Log2 Fold Change",y="-Log10 p-value") +theme(legend.title=element_blank())
+EnhancedVolcano(resrtmin,lab = rownames(resrtmin),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+#heatmap
+heatmap_rtmin=t(apply(countrtmin[rownames(countrtmin) %in% rownames(resrtmin_df[order(-abs(resrtmin_df$log2FoldChange)), ][1:100, ]),],1,scale))
+colnames(heatmap_rtmin)=colnames(countrtmin)
+pheatmap(heatmap_rtmin,annotation_col = metartmin[,c("TBI.Condition","idtp")],cluster_cols = FALSE,show_colnames = F)
+
+```
+#Figure 4: Selective Enirchment by Group
+```{r}
+#heatmap highly variable genes per group
+library(Seurat)
+# Assuming `counts` is your raw count matrix (genes as rows, samples as columns)
+rownames(rawcount)=rawcount$gene
+seurat_obj <- CreateSeuratObject(counts = rawcount[,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]])
+seurat_obj <- NormalizeData(seurat_obj)
+# Identify the top variable genes
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+# Extract highly variable genes
+hvg_genes <- VariableFeatures(seurat_obj)
+
+heatmap_hvg=t(apply(rawcount[hvg_genes,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]],1,scale))
+colnames(heatmap_hvg)=colnames(rawcount[,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]])
+pheatmap(heatmap_hvg,cluster_cols = FALSE,show_colnames = F)
+```
+#PCA FUNCTION
+```{r}
+## PCA plot
+#input must be: 
+  #gene count dataframe where each column is a sample and each row is a gene.
+  #dataframe with metadata: 1st column named 'Sample' and 2nd named 'groupgb0
+pcagb <- function(qcpca,qc){
+genecount <- log(qcpca+1,2)
+# Which values in genecount are greater than 1.5?
+thresh <- genecount  > 1.5
+# This produces a logical matrix with TRUEs and FALSEs
+head(thresh)
+# Summary of how many TRUEs there are in each row
+table(rowSums(thresh))
+# we would like to keep genes that have at least 2 TRUES in each row of thresh
+keep <- rowSums(thresh) >= 5
+# Subset the rows of countdata to keep the more highly expressed genes
+counts.keep <- genecount[keep,]
+summary(keep)
+dim(counts.keep)
+# We estimate the variance for each row in the logcounts matrix
+var_genes <- apply(genecount, 1, var)
+head(var_genes)
+# Get the gene names for the top 500 most variable genes
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+head(select_var)
+# Subset logcounts matrix
+highly_variable_lcpm <- genecount[select_var,]
+dim(highly_variable_lcpm)
+head(highly_variable_lcpm)
+Genes_wo_hit <- apply(highly_variable_lcpm,1,function(x) all(x==0))
+genecount_nozero <- highly_variable_lcpm[!Genes_wo_hit,]
+genecount_PCA <- t(genecount_nozero)
+
+# Run PCA
+PCA_out <- prcomp(genecount_PCA, scale. = TRUE)
+
+# Generate the summary stats for prcomp
+eigs <- PCA_out$sdev^2
+summary <- rbind(
+  SD = sqrt(eigs),
+  Proportion = eigs/sum(eigs),
+  Cumulative = cumsum(eigs)/sum(eigs))
+# Find the proprtion of PC1 and PC2
+propPC1 <- round(as.numeric(summary[2,1]) * 100)
+propPC2 <- round(as.numeric(summary[2,2]) * 100)
+
+# Plot PCA
+my.pca <- data.frame(PCA_out$x[,1:3])
+my.pca[,colnames(qc)[1]] <- rownames(my.pca)
+iv <- match(my.pca[,colnames(qc)[1]], qc[,1])
+#potential_batch <- c("input_reads","libSize","exon_fraction","PASS","groupgb")
+my.pca=merge(qc,my.pca)
+
+  return(ggplot(data = my.pca, mapping = aes(x = PC1,y = PC2, colour =my.pca[,2], label=TRUE)) +
+  geom_point(size = 2) +
+  theme_bw() +
+    #geom_text(aes(label = my.pca[,2]), size=2,vjust = -1, hjust = 1)+
+  xlab(paste0("PC-1 (", propPC1, "%)")) +
+  ylab(paste0("PC-2 (", propPC2, "%)"))+theme(legend.title = element_blank(),legend.position = "top"))
+}
+```
+
+#Patient ID info
+```{r}
+demo=read.xlsx("Use this one_TP Tracking System Hayden Lab - with PHI - 2024-06-28.xlsx",sheet = 1,detectDates = T)
+counts=read.delim("counts_genenames.txt",header = T,sep=" ")
+demosub=demo[demo$TP %in% unique(as.numeric(gsub("[[:alpha:]]", "",colnames(counts)[grepl("TP",colnames(counts))]))),]
+#unique(demosub$Patient.ID)
+meta=read.delim("metadata_CSF_Seq_ALL.txt")
+lung=read.xlsx("lung_data_GB.xlsx")
+lung$Sample=paste0("TP",as.numeric(gsub("\\D","",lung$TP)))
+meta$tp=as.numeric(gsub("\\D", "",meta$Sample))
+demo$Sample=paste0("TP",as.numeric(demo$TP))
+new=merge(meta,demo,all.x=T)
+new$Group[new$Group=="BCBM"]="Breast_LMD"
+new$Group[new$Group=="LMD"]="Lung_LMD"
+new=new[new$Group!="TP",]#let's exclude TP632,633,634 because these are marked as Dan's samples, so likely duplicates of TBI samples.
+new$Group[new$Group=="TP691"]="NonCancer_CTRL"
+#View(meta[!meta$Sample %in% new$Sample,]) #samples excluded: Mayo, QT, TBI+TP, TPX, OHSU.
+new$Dx[is.na(new$Dx)]=new$Suspected.Dx[is.na(new$Dx)]
+newfin=new[,c("Sample","Group","Collecting.Date","Patient.ID","DOB","DOD","Sex","Race","Ethnicity.(Hispanic.or.non-hispanic)","Smoking.Hx","Procedure","Dx","Mutations")]
+#setdiff(lung$Sample,newfin$Sample)
+metall=readxl::read_excel("CSF.Seq_Metadata.xlsx")
+```
+#QC
+```{r}
+starmap=read.delim("CSF_Seq_STAR_mapping_statistics.txt")
+qco=read.delim("CSF_Seq_Metadata_W_QC_Metrics.txt")
+qco$Group[qco$Group=="TP691"]="NonCancer_CTRL"
+newfin$groupgb=newfin$Group
+qc=merge(qco,newfin[,c("Sample","groupgb")])
+qc=qc[!duplicated(qc$Sample),] 
+qc=qc[!grepl("X",qc$Sample) & qc$groupgb!="CART_GBM" & qc$groupgb!="Brain_CTRL" & !grepl("OHSU",qc$groupgb),]
+table(qc$groupgb)
+qc=qc[!(qc$Group=="TBI" & (grepl("TP",qc$Sample) | substr(qc$Sample,5,6)!=11 | qc$Sample=="TBI131")),]
+qco$sample=qco$Sample
+qco$Sample=factor(qco$sample,levels=qco$sample[order(qco$libSize)])
+qco$libmedian=ifelse(qco$libSize<median(qco$libSize),"low","high")
+
+qc=qc[order(qc$groupgb),]
+qc$groupgb <- factor(qc$groupgb, levels = c("Breast_LMD", "Lung_LMD", "Mayo_GBM", "NonCancer_CTRL","TBI"))
+ggplot(qc, aes(x=Sample, y=input_reads, fill=groupgb)) +
+  geom_bar(stat="identity") +
+  ylab("Input reads") +
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+#exclude those with counts below 50.000.000 (put 53 because a case barely passes that threshold)
+qc=qc[qc$input_reads>53000000,]
+
+
+qclong=qc %>% tidyr::pivot_longer(cols=c("intron_fraction","exon_fraction","intergenic_fraction"),names_to = "fraction",values_to = "value")
+ggplot(qclong, aes(x=Sample, y=value, fill=fraction)) +
+  geom_bar(stat="identity") +
+  ylab("Fractions") +
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+ggplot(qco, aes(x=Sample, y=input_reads, fill=Group)) +
+  geom_bar(stat="identity") +
+  ylab("Input reads") +
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+```
+
+```{r}
+metall$sample=metall$Sample.ID
+metall=merge(metall,qco[,!colnames(qco) %in% "Group"],all.x=T,by="sample")
+ggplot(metall[!is.na(metall$libSize),], aes(x=sample, y=libSize, fill=Group)) +
+  geom_bar(stat="identity") +
+  ylab("Library Size") + scale_y_log10()+
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+ggplot(metall[!is.na(metall$libSize),], aes(x=sample, y=input_reads, fill=Group)) +
+  geom_bar(stat="identity") +
+  ylab("Input reads number") + scale_y_log10()+
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+ggplot(metall[!is.na(metall$libSize),], aes(x=sample, y=exon_fraction,fill=Group)) +
+  geom_bar(stat="identity") +
+  ylab("Exon Fractions") +
+  xlab("Sample") +
+  theme(plot.margin = unit(c(0.3,0,0.3,0),"cm"),
+        axis.text.x=element_text(angle = 90, size = 5),
+        axis.text.y=element_text(size=5),
+        axis.title.y=element_text(size=8),
+        axis.title.x=element_text(size=8),
+        legend.title=element_blank(),
+        legend.text=element_text(size=8),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+```
+```{r}
+rownames(counts)=counts$gene
+counts=counts[6:nrow(counts),]
+dds <- DESeqDataSetFromMatrix(countData = counts[,2:length(colnames(counts))],
+                              colData = meta,  # Data frame with sample info (e.g., condition, etc.)
+                              design = ~ Group)       # Replace `condition` with your factor of interest
+dds <- DESeq(dds)
+normalized_counts <- counts(dds, normalized = TRUE)
+countlong= data.frame(normalized_counts,row.names = rownames(normalized_counts)) %>% mutate(gene=rownames(.)) %>% tidyr::pivot_longer(cols=colnames(normalized_counts),names_to = "sample",values_to = "count")
+countlong$input_reads=ifelse(countlong$sample %in% qco$Sample[qco$input_reads<1e+08],"low","high") #100 million
+countlong$libsize=ifelse(countlong$sample %in% qco$Sample[qco$libSize<2e+05],"low","high") #200 thous
+countlong$exon=ifelse(countlong$sample %in% qco$Sample[qco$exon_fraction<0.4],"low","high")
+
+countlong=countlong%>%group_by(sample) %>%
+  arrange(count, .by_group = TRUE) %>%
+  mutate(x = row_number())
+
+zero_counts <- data.frame(zero_counts=apply(as.matrix(counts[,2:length(colnames(counts))]), 2, function(x) sum(x == 0)))
+zero_counts$Sample=rownames(zero_counts)
+qco=merge(qco,zero_counts)
+
+ggplot(qco, aes(x=zero_counts, y=libSize)) + geom_point(size=4, shape=1)+theme_bw()+geom_smooth()+stat_cor(method = "spearman")
+ggplot(qco, aes(x=zero_counts, y=input_reads)) + geom_point(size=4, shape=1)+theme_bw()+geom_smooth()+stat_cor(method = "spearman")
+ggplot(qco, aes(x=zero_counts, y=exon_fraction)) + geom_point(size=4, shape=1)+theme_bw()+geom_smooth()+stat_cor(method = "spearman")
+
+ggplot(qco, aes(x=zero_counts, y=libSize)) + geom_point(size=4, shape=1,aes(color=Group))+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')
+ggplot(qco[qco$Group!="Undetermined_OHSU",], aes(x=nrow(counts)-zero_counts, y=libSize)) + geom_point(size=4, shape=1,aes(color=Group))+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')+xlab("Number of genes with non-zero counts")
+ggplot(qco, aes(x=zero_counts, y=input_reads)) + geom_point(size=4, shape=1)+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')
+
+#final plots
+ggplot(qco[qco$Group!="Undetermined_OHSU",], aes(x=nrow(counts)-zero_counts, y=libSize)) + geom_point(size=4, shape=1,aes(color=Group))+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')+xlab("Number of genes with non-zero counts")
+ggplot(qco[qco$Group!="Undetermined_OHSU",], aes(x=nrow(counts)-zero_counts, y=libSize)) + geom_point(size=4, shape=1)+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')+xlab("Number of genes with non-zero counts")+ylab("Library size")
+ggplot(qco[qco$Group!="Undetermined_OHSU",], aes(x=nrow(counts)-zero_counts, y=input_reads)) + geom_point(size=4, shape=1,aes(color=Group))+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')+xlab("Number of genes with non-zero counts")
+```
+#overlap of non-zero genes
+```{r}
+ggplot(qco[qco$Group!="Undetermined_OHSU",], aes(x=nrow(counts)-zero_counts, y=libSize)) + geom_point(size=4, shape=1,aes(color=Group))+theme_bw()+geom_smooth()+stat_cor(method = "spearman")+ scale_y_continuous(trans='log10')+xlab("Number of genes with non-zero counts")+geom_hline(yintercept = 5e+04)
+
+# Convert to a binary matrix (TRUE for counts > 0, FALSE for 0)
+binary_counts <- data.frame(counts[,-1] > 0)
+binary_counts <- binary_counts[,colnames(binary_counts) %in% qco$Sample[qco$libSize>5e+04]]
+
+# Check overlap across samples
+overlap_counts <- rowSums(binary_counts)
+
+# Display the number of samples in which each gene has a non-zero count
+print(overlap_counts)
+
+# Find genes with overlaps in all samples
+genes_in_all_samples <- rownames(binary_counts)[overlap_counts == ncol(binary_counts)] #~1000 genes shared
+nonzerogenes=rownames(binary_counts)[overlap_counts > 0] #40000 genes with at least 1 non-zero sample
+
+binary_counts_lowlib <- data.frame(counts[,-1] > 0)[,colnames(counts) %in% qco$Sample[qco$libSize<7e+04]]
+overlap_lowlib=rowSums(binary_counts_lowlib)
+genes_in_all_lowlib <- rownames(binary_counts_lowlib)[overlap_lowlib == ncol(binary_counts_lowlib)]
+table(genes_in_all_samples %in% genes_in_all_lowlib) #most of those 1000 genes are included in lowlib.
+```
+```{r}
+ggplot(countlong[countlong$gene %in% genes_in_all_samples,], aes(x=gene, y=count, group=sample,color=sample)) +
+  geom_line() +
+  ylab("Norm. counts") +
+  xlab("Gene")+ylim(0,100)+theme(legend.position = "none")
+
+countlong$libsize=ifelse(countlong$sample %in% qco$Sample[qco$libSize<5e+04],"low","high") #50.000 thous
+countlong_sub=countlong[countlong$gene %in% genes_in_all_samples,] %>% group_by(sample)%>% mutate(countz=scale(count))
+ggplot(countlong_sub, aes(x = gene, y = sample, fill = countz+1)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue",trans='log10') +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_wrap(vars(libsize),scales = "free_y")  # Rotate x-axis labels for readability
+countlong_sub=countlong_sub%>%group_by(gene)%>%mutate(count_by_gene=rescale(count,to=c(1,2)))
+ggplot(countlong_sub, aes(x = gene, y = sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue",trans='log10') +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_wrap(vars(libsize),scales = "free_y")  # Rotate x-axis labels for readability
+countlong_sub=merge(qco[,c("Sample","sample")],countlong_sub,by="sample")
+countlong_sub=countlong_sub%>%group_by(gene)%>%mutate(count_by_gene=rescale(count,to=c(0,1)))
+ggplot(countlong_sub, aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+countlong=countlong%>%group_by(sample)%>%mutate(countz=scale(count))
+countlong=countlong%>%group_by(gene)%>%mutate(count_by_gene=rescale(count,to=c(0,1))) #this would change several zeros to something slightly higher than 0
+countlong=merge(qco[,c("Sample","sample","libmedian")],countlong,by="sample")
+ggplot(countlong, aes(x = gene, y = sample, fill = countz+1)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue",trans='log10') +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_wrap(vars(libsize),scales = "free_y")  # Rotate x-axis labels for readability
+ggplot(countlong, aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(countlong, aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_wrap(vars(libmedian),scales = "free_y")
+```
+#including only those 1000 genes detected in most samples
+```{r}
+ggplot(countlong[countlong$gene %in% genes_in_all_samples,], aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggplot(countlong[countlong$gene %in% genes_in_all_samples,], aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+facet_wrap(vars(libmedian),scales = "free_y")
+```
+#normalization by gene after excluding control samples and TP001
+```{r}
+countlong_sub2=countlong[!grepl("CTRL",countlong$sample) & countlong$sample!="TP001",]%>%group_by(gene)%>%mutate(count_by_gene=rescale(count,to=c(0,1)))
+ggplot(countlong_sub2[countlong_sub2$gene %in% genes_in_all_samples,], aes(x = gene, y = Sample, fill = count_by_gene)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +  # Adjust color scale as needed
+  labs(x = "Gene", y = "Group", fill = "Normalized Count", title = "Heatmap of Normalized Counts") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+#the results are quite equivalent to those without exclusion
+```
+#LOAD DATA
+```{r}
+workingdir="" #path where CSF-Seq_Project_10.04.2024 is located 
+rawcount=read.xlsx(paste0(workingdir,"/CSF-Seq_Project_10.04.2024/Data\ Files\ Updated\ _\ 10.29.24/CSF.Seq_Counts.xlsx"))
+metall=data.frame(readxl::read_excel(paste0(workingdir,"/CSF-Seq_Project_10.04.2024/Data\ Files\ Updated\ _\ 10.29.24/CSF.Seq_Metadata.xlsx")))
+rownames(metall)=metall$Sample.ID_2
+library(biomaRt)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+protein_coding_genes <- getBM(
+    attributes = c("hgnc_symbol", "ensembl_gene_id"), # HGNC symbols and Ensembl gene IDs
+    filters = "biotype",
+    values = "protein_coding", # Filter for protein-coding genes
+    mart = ensembl
+)
+#table(protein_coding_genes)
+unique(protein_coding_genes$hgnc_symbol) #19466 unique protein coding genes
+table(rowSums(rawcount[rawcount$gene %in% protein_coding_genes$hgnc_symbol,-1])>0)
+rawcount=rawcount[rowSums(rawcount[,-1])>0 & rawcount$gene %in% protein_coding_genes$hgnc_symbol,]
+```
+
+#Figure 3H TIMECOURSE DATA
+```{r}
+metalong=metall[!is.na(metall$Longitudinal),]
+countlong=rawcount[,c("gene",colnames(rawcount)[colnames(rawcount) %in% metalong$Sample.ID_2])]
+rownames(countlong)=countlong$gene
+countlong=countlong[,-1]
+countlong=countlong[rowSums(countlong)>0,]
+
+#USE ONLY TBI FOR LONGITUDINAL ANALYSES, BECAUSE GBM AND BREAST_LMD SAMPLE SIZE IS TOO LOW (N=2 per group)
+metalong2=metalong[metalong$TBI.Day %in% c(1,3) & metalong$Group=="TBI",] %>%
+  mutate(timef=factor(ifelse(TBI.Day==1,"Baseline","FU")),ptid=factor(gsub(" ","",Patient.ID)))
+countlong2=countlong[,metalong2$Sample.ID_2]
+all(metalong2$Sample.ID_2 == colnames(countlong2))
+dds=DESeqDataSetFromMatrix(countData = countlong2[,metalong2$Sample.ID_2[metalong2$Group=="TBI"]],
+                              colData = metalong2[metalong2$Group=="TBI",],
+                              design = ~ ptid+timef)
+
+dds=DESeq(dds)
+resdds=results(dds)
+resdds_df=as.data.frame(resdds)
+resdds_df$significant <- ifelse(resdds_df$padj < 0.05, "Significant", "Not Significant")
+EnhancedVolcano(resdds,lab = rownames(resdds),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+
+
+countlong_wide=data.frame(t(as.matrix(countlong))+0.5) #as in DESeq2, add 0.5 for for log2FC calculation to avoid zeroes.
+countlong_wide$Sample.ID_2=rownames(countlong_wide)
+countlong_log2fc=merge(metalong[metalong$Group=="TBI",c("Sample.ID_2","Patient.ID","TBI.Day")],countlong_wide) %>%
+  pivot_longer(cols = gsub("-",".",rownames(countlong)), names_to = "gene", values_to = "Value") %>%
+  group_by(Patient.ID, gene) %>%
+  mutate(Base = Value[TBI.Day == 1]) %>%
+  mutate(Log2FC = log2(Value / Base)) %>%
+  ungroup() %>%
+  dplyr::select(-Base) # Remove the baseline column if not needed
+countlong_log2fc$idtp=paste(countlong_log2fc$Patient.ID,countlong_log2fc$TBI.Day,sep="_")
+
+ggplot(countlong_log2fc[countlong_log2fc$Patient.ID%in%metalong2$Patient.ID[metalong2$Group=="TBI"] & countlong_log2fc$gene %in% rownames(resdds_df[resdds_df$significant=="Significant",]),], aes(x=as.numeric(`TBI.Day`)-1, y=Log2FC,color=gene)) + #geom_point(size=4, shape=1,aes(color=Patient.ID))+
+  theme_bw()+geom_smooth(alpha = 0.1,aes(fill = gene))+labs(color = "DEGs",fill="DEGs")+xlab("Time (Days)")
+```
+#Figure 6: Method Reproducibility (A-C)
+```{r}
+#RT vs ICE (only subject TBI9, repeated at multiple post-TBI day (1,2,3,7))
+countrtice=rawcount[,metall$Sample.ID_2[
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$Patient.ID %in% unique(subset(metall,TBI.Condition=="Ice_30min")["Patient.ID"])]) &  
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Day %in% pull(unique(subset(metall,TBI.Condition=="Ice_30min")["TBI.Day"]))]) &
+  (metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Condition!="RT_60min"])
+  ]]
+rownames(countrtice)=rawcount$gene
+
+metartice=data.frame(metall[metall$Sample.ID_2 %in% colnames(countrtice),])
+rownames(metartice)=metartice$Sample.ID_2
+  
+rtice <- DESeqDataSetFromMatrix(countData = countrtice,
+                          colData = metartice,
+                          design = ~ TBI.Day+TBI.Condition )
+rtice=DESeq(rtice)
+resrtice=results(rtice)
+resrtice_df=as.data.frame(resrtice)
+resrtice_df$significant <- ifelse(resrtice_df$padj < 0.05, "Significant", "Not Significant")
+ggplot(resrtice_df, aes(x=log2FoldChange, y=-log10(pvalue))) +geom_point(alpha=0.5) +scale_color_manual(values=c("red", "black")) +theme_minimal() +labs(title="Volcano Plot",x="Log2 Fold Change",y="-Log10 p-value") +theme(legend.title=element_blank())
+EnhancedVolcano(resrtice,lab = rownames(resrtice),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+#heatmap
+heatmap_rtice=t(apply(countrtice[rownames(countrtice) %in% rownames(resrtice_df[order(-abs(resrtice_df$log2FoldChange)), ][1:100, ]),],1,scale))
+colnames(heatmap_rtice)=colnames(countrtice)
+pheatmap(heatmap_rtice,annotation_col = metartice[,c("TBI.Condition","TBI.Day")],cluster_cols = FALSE,show_colnames = F)
+
+
+
+#RT 30 vs 60 minutes (only subject TBI9, repeated at multiple post-TBI day (1,2,3,7))
+countrtmin=rawcount[,metall$Sample.ID_2[
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$Patient.ID %in% pull(unique(subset(metall,TBI.Condition=="RT_60min")["Patient.ID"]))]) &  
+(metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Day %in% pull(unique(subset(metall,TBI.Condition=="RT_60min")["TBI.Day"]))]) &
+  (metall$Sample.ID_2 %in% metall$Sample.ID_2[metall$TBI.Condition!="Ice_30min"])
+  ]]
+rownames(countrtmin)=rawcount$gene
+
+metartmin=data.frame(metall[metall$Sample.ID_2 %in% colnames(countrtmin),])
+rownames(metartmin)=metartmin$Sample.ID_2
+metartmin$idtp=paste(metartmin$Patient.ID,metartmin$TBI.Day,sep="_")
+  
+rtmin <- DESeqDataSetFromMatrix(countData = countrtmin,
+                          colData = metartmin,
+                          design = ~ idtp+TBI.Condition )
+rtmin=DESeq(rtmin)
+resrtmin=results(rtmin)
+resrtmin_df=as.data.frame(resrtmin)
+resrtmin_df$significant <- ifelse(resrtmin_df$padj < 0.05, "Significant", "Not Significant")
+ggplot(resrtmin_df, aes(x=log2FoldChange, y=-log10(pvalue))) +geom_point(alpha=0.5) +scale_color_manual(values=c("red", "black")) +theme_minimal() +labs(title="Volcano Plot",x="Log2 Fold Change",y="-Log10 p-value") +theme(legend.title=element_blank())
+EnhancedVolcano(resrtmin,lab = rownames(resrtmin),x = 'log2FoldChange',y = 'pvalue',col=c("grey30","grey30", "grey30", "red2"))
+#heatmap
+heatmap_rtmin=t(apply(countrtmin[rownames(countrtmin) %in% rownames(resrtmin_df[order(-abs(resrtmin_df$log2FoldChange)), ][1:100, ]),],1,scale))
+colnames(heatmap_rtmin)=colnames(countrtmin)
+pheatmap(heatmap_rtmin,annotation_col = metartmin[,c("TBI.Condition","idtp")],cluster_cols = FALSE,show_colnames = F)
+
+```
+#Figure 4: Selective Enirchment by Group
+```{r}
+#heatmap highly variable genes per group
+library(Seurat)
+# Assuming `counts` is your raw count matrix (genes as rows, samples as columns)
+rownames(rawcount)=rawcount$gene
+seurat_obj <- CreateSeuratObject(counts = rawcount[,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]])
+seurat_obj <- NormalizeData(seurat_obj)
+# Identify the top variable genes
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+# Extract highly variable genes
+hvg_genes <- VariableFeatures(seurat_obj)
+
+heatmap_hvg=t(apply(rawcount[hvg_genes,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]],1,scale))
+colnames(heatmap_hvg)=colnames(rawcount[,metall$Sample.ID_2[!is.na(metall$Cross.Sectional) & metall$Group!="Brain_Tissue"]])
+pheatmap(heatmap_hvg,cluster_cols = FALSE,show_colnames = F)
+```
+### Volcano Plot of Breast vs Lung LMD
+```{r}
+bl=counts[,colnames(counts) %in% metall$Sample.ID[metall$Group %in% c("Breast_LMD","Lung_LMD") & metall$Cross.Sectional=="Cross.Sectional" & !is.na(metall$Cross.Sectional) & !metall$Sample.ID %in% c("TP377","TP433OHSU")]]
+metabl=metall[metall$Group %in% c("Breast_LMD","Lung_LMD") & metall$Cross.Sectional=="Cross.Sectional" & !is.na(metall$Cross.Sectional) & !metall$Sample.ID %in% c("TP377","TP433OHSU"),] 
+#TP377 because low quality, TP433OHSU because it does not have a corresponding TP Stanford.
+bl=bl[,metabl$Sample.ID]
+all(metabl$Sample.ID == colnames(bl))
+
+#LMD vs NonCancer_CTRL
+lm <- DESeqDataSetFromMatrix(countData = bl,
+                              colData = metabl,
+                              design = ~ Group)
+lm=DESeq(lm)
+reslm=results(lm)
+reslm_df=as.data.frame(reslm)
+reslm_df$gene=rownames(reslm_df)
+reslm_df$significant <- ifelse(is.na(reslm_df$padj),"exclude",ifelse(reslm_df$padj < 0.05 & abs(reslm_df$log2FoldChange)>1.5, "Significant", "Not Significant"))
+sign_lm <- rownames(reslm_df[abs(reslm_df$log2FoldChange) > 5 & !is.na(reslm_df$log2FoldChange) & reslm_df$significant=="Significant",])
+EnhancedVolcano(reslm_df,lab = NA,x = 'log2FoldChange',y = 'pvalue',col=c("grey30", 
+    "grey30", "grey30", "red2"),#xlim = c(-10,10),ylim = c(0,35)
+  )+
+  geom_text_repel(
+    data = reslm_df[abs(reslm_df$log2FoldChange) > 5 & !is.na(reslm_df$log2FoldChange) & reslm_df$significant=="Significant",], # Subset genes to label
+    aes(x = log2FoldChange, y = -log10(pvalue), label = gene),
+    size = 3, # Adjust label size
+    color = 'black',
+    max.overlaps = 10 # Adjust for better visibility
+  )
+#positive values indicate highly expressed in lung LMD compared with controls.
+vsdlm=vst(lm,blind = F)
+plotPCA(vsdlm, intgroup=c("Group"))
+pcagb(bl,metabl[,c("Sample.ID","Group")])
+
+
+# Convert gene symbols to Entrez IDs
+gene_lm <- reslm_df$gene[reslm_df$significant=="Significant"]
+entrez_lm <- mapIds(org.Hs.eg.db, keys = gene_lm, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+
+# Perform GO enrichment analysis
+egolm <- enrichGO(gene = entrez_lm, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.05)
+
+# View results
+head(egolm)
+
+# Plot results
+barplot(egolm, showCategory = 10)
+dotplot(egolm)
+```
+### Volcano Plot of Breast & Lung LMD vs Non-Cancer Control
+```{r}
+blc=counts[,colnames(counts) %in% metall$Sample.ID[metall$Group %in% c("Breast_LMD","Lung_LMD","NonCancer_CTRL") & metall$Cross.Sectional=="Cross.Sectional" & !is.na(metall$Cross.Sectional) & !metall$Sample.ID %in% c("TP377","TP433OHSU")]]
+metablc=metall[metall$Group %in% c("Breast_LMD","Lung_LMD","NonCancer_CTRL") & metall$Cross.Sectional=="Cross.Sectional" & !is.na(metall$Cross.Sectional) & !metall$Sample.ID %in% c("TP377","TP433OHSU"),] 
+#TP377 because low quality, TP433OHSU because it does not have a corresponding TP Stanford.
+blc=blc[,metablc$Sample.ID]
+all(metablc$Sample.ID == colnames(blc))
+
+#LMD vs NonCancer_CTRL
+lmd <- DESeqDataSetFromMatrix(countData = blc,
+                              colData = metablc,
+                              design = ~ Group_Detail_2)
+lmd=DESeq(lmd)
+reslmd=results(lmd)
+reslmd_df=as.data.frame(reslmd)
+reslmd_df$gene=rownames(reslmd_df)
+reslmd_df$significant <- ifelse(is.na(reslmd_df$padj),"exclude",ifelse(reslmd_df$padj < 0.05 & abs(reslmd_df$log2FoldChange)>1.5, "Significant", "Not Significant"))
+significant_genes <- rownames(reslmd_df[abs(reslmd_df$log2FoldChange) > 5 & !is.na(reslmd_df$log2FoldChange) & reslmd_df$significant=="Significant",])
+EnhancedVolcano(reslmd_df,lab = NA,x = 'log2FoldChange',y = 'pvalue',col=c("grey30", 
+    "grey30", "grey30", "red2"),selectLab = significant_genes,drawConnectors = TRUE, # Draw lines to connect labels
+  widthConnectors = 0.5, # Thickness of connectors
+  colConnectors = 'black', # Color of connectors
+  labSize = 4,xlim = c(-10,10),ylim = c(0,35))+
+  geom_text_repel(
+    data = reslmd_df[abs(reslmd_df$log2FoldChange) > 5 & !is.na(reslmd_df$log2FoldChange) & reslmd_df$significant=="Significant",], # Subset genes to label
+    aes(x = log2FoldChange, y = -log10(pvalue), label = gene),
+    size = 3, # Adjust label size
+    color = 'black',
+    max.overlaps = 10 # Adjust for better visibility
+  )
+#positive values indicate highly expressed in LMD compared with controls.
+vsdlmd=vst(lmd,blind = F)
+plotPCA(vsdlmd, intgroup=c("Group"))
+plotPCA(vsdlmd, intgroup=c("Group_Detail"))
+pcagb(blc,metablc[,c("Sample.ID","Group")])
+pcagb(blc,metablc[,c("Sample.ID","Group_Detail")])
+```
+#SURVIVAL ANALYSIS in LMD
+```{r}
+events=readxl::read_excel("event_data_CW.xlsx",sheet = 2)
+events$Description[events$`Event Type`=="Sample"] #58 samples but 53 patient IDs?
+#events$Description[events$`Event Type`=="Diagnosis"]
+metagb=read.csv("metadata_GB.csv")
+metacw=readxl::read_excel("Patientdata_CW.xlsx",sheet=1)
+meta$Sample[!meta$Sample %in% metagb$Sample] #CTRL, MAYO, QT, TBI, TPOHSU and some other TPs are not in metaCW.
+table(metacw$`Study Group`)
+table(events$Description[events$`Event Type`=="Diagnosis" & events$Patient %in% metacw$`Patient Id`[grepl("LMD",metacw$`Study Group`)]])
+metacw$lmdate=as.Date(as.numeric(metacw$`LMD Diagnosis Date`), origin = "1899-12-30")
+metacw$Patient=metacw$`Patient Id`
+metacw$lmdate[metacw$Patient==48]=as.Date("2021-02-08")
+          
+metacw=merge(events[events$`Event Type`=="Sample" & events$Description %in% metablc$Sample.ID,c("Patient","Description","Date")],metacw,by="Patient",all.y=T)
+blong=metacw[metacw$Description %in% metabl$sample,c("Patient","Description","Date","Primary  Tumor  Diagnosis Date","lmdate","Date of Death")]%>%pivot_longer(cols=c("Date","Primary  Tumor  Diagnosis Date","lmdate","Date of Death"),names_to = "event",values_to = "date") %>% group_by(Patient)%>%mutate(reldate=lubridate::time_length(lubridate::interval(date[event=="Date"],date), "months"))
+blong$reldate[blong$event=="Date of Death" & is.na(blong$reldate)]=max(blong$reldate[blong$event=="Date of Death"],na.rm = T)+10
+blong$event=factor(blong$event,labels=c("CSF date","Date of Death","LMD diagnosis date","Primary tumor diagnosis date"))
+ggplot(blong,aes(reldate,Description))+geom_line()+geom_point(aes(color=event))+xlab("Time (months)")+ylab("Patient")
+metacw$dodlmdiff=lubridate::time_length(lubridate::interval(metacw$lmdate,metacw$`Date of Death`), "months")
+metacw$survlm=ifelse(metacw$dodlmdiff>25 | (!is.na(metacw$lmdate) & is.na(metacw$`Date of Death`)),"long","short")
+events= events %>% group_by(Patient) %>% mutate(lastevent=max(Date))
+metacw=merge(metacw,events[!duplicated(events$Patient),c("Patient","lastevent")],by="Patient",all.x=T)
+metacw$ostime=ifelse(is.na(metacw$`Date of Death`),
+                     lubridate::time_length(lubridate::interval(metacw$lmdate,metacw$lastevent), "months"),
+                     lubridate::time_length(lubridate::interval(metacw$lmdate,metacw$`Date of Death`), "months"))
+metacw$survlm2=ifelse(metacw$Deceased==T & metacw$ostime<25,"short",metacw$survlm)
+metacw$sample=metacw$Description
+
+
+survbl=counts[,colnames(counts) %in% intersect(metacw$sample[!is.na(metacw$survlm)],metall$Sample.ID[metall$Group %in% c("Breast_LMD","Lung_LMD") & metall$Cross.Sectional=="Cross.Sectional" & !is.na(metall$Cross.Sectional) & !metall$Sample.ID %in% c("TP377","TP433OHSU")])]
+metasurvbl=metacw[!is.na(metacw$survlm),]
+#metasurvbl$group=metasurvbl$`Study Group`
+#TP377 because low quality, TP433OHSU because it does not have a corresponding TP Stanford.
+survbl=survbl[,metasurvbl$sample]
+all(metasurvbl$sample == colnames(survbl))
+
+#LMD survival #ALL GENES
+survlm <- DESeqDataSetFromMatrix(countData = survbl,
+                              colData = metasurvbl,
+                              design = ~ survlm)
+survlm=DESeq(survlm)
+ressurvlm=results(survlm)
+ressurvlm_df=as.data.frame(ressurvlm)
+ressurvlm_df$gene=rownames(ressurvlm_df)
+ressurvlm_df$significant <- ifelse(is.na(ressurvlm_df$padj),"exclude",ifelse(ressurvlm_df$padj < 0.05 & abs(ressurvlm_df$log2FoldChange)>1.5, "Significant", "Not Significant"))
+sign_lm <- rownames(ressurvlm_df[abs(ressurvlm_df$log2FoldChange) > 5 & !is.na(ressurvlm_df$log2FoldChange) & ressurvlm_df$significant=="Significant",])
+EnhancedVolcano(ressurvlm_df,lab = NA,x = 'log2FoldChange',y = 'pvalue',col=c("grey30", 
+    "grey30", "grey30", "red2"),#xlim = c(-10,10),ylim = c(0,35)
+  )+
+  geom_text_repel(
+    data = ressurvlm_df[abs(ressurvlm_df$log2FoldChange) > 5 & !is.na(ressurvlm_df$log2FoldChange) & ressurvlm_df$significant=="Significant",], # Subset genes to label
+    aes(x = log2FoldChange, y = -log10(pvalue), label = gene),
+    size = 3, # Adjust label size
+    color = 'black',
+    max.overlaps = 10 # Adjust for better visibility
+  )
+#positive values indicate highly expressed in short survival vs long survival
+vsdsurvlm=vst(survlm,blind = F)
+plotPCA(vsdsurvlm, intgroup=c("survlm"))
+pcagb(survbl,metasurvbl[,c("sample","survlm")])
+
+#LMD survival #ALL GENES detected at least in 1 sample (34236) 
+survlm <- DESeqDataSetFromMatrix(countData = survbl[rownames(survbl[rowSums(survbl)>0,]),],
+                              colData = metasurvbl,
+                              design = ~ survlm)
+survlm=DESeq(survlm)
+ressurvlm=results(survlm)
+ressurvlm_df=as.data.frame(ressurvlm)
+ressurvlm_df$gene=rownames(ressurvlm_df)
+ressurvlm_df$significant <- ifelse(is.na(ressurvlm_df$padj),"exclude",ifelse(ressurvlm_df$padj < 0.05 & abs(ressurvlm_df$log2FoldChange)>1.5, "Significant", "Not Significant"))
+sign_lm <- rownames(ressurvlm_df[abs(ressurvlm_df$log2FoldChange) > 5 & !is.na(ressurvlm_df$log2FoldChange) & ressurvlm_df$significant=="Significant",])
+EnhancedVolcano(ressurvlm_df,lab = NA,x = 'log2FoldChange',y = 'pvalue',col=c("grey30", 
+    "grey30", "grey30", "red2"),#xlim = c(-10,10),ylim = c(0,35)
+  )+
+  geom_text_repel(
+    data = ressurvlm_df[ressurvlm_df$significant=="Significant",], # Subset genes to label
+    aes(x = log2FoldChange, y = -log10(pvalue), label = gene),
+    size = 3, # Adjust label size
+    color = 'black',
+    max.overlaps = 10 # Adjust for better visibility
+  )
+#positive values indicate highly expressed in short survival vs long survival
+vsdsurvlm=vst(survlm,blind = F)
+plotPCA(vsdsurvlm, intgroup=c("survlm"))
+pcagb(survbl[rownames(survbl[rowSums(survbl)>0,]),],metasurvbl[,c("sample","survlm")])
+#The results are the same
+
+# Convert gene symbols to Entrez IDs
+gene_surv <- ressurvlm_df$gene[ressurvlm_df$significant=="Significant"]
+entrez_surv <- mapIds(org.Hs.eg.db, keys = gene_surv, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+
+# Perform GO enrichment analysis
+egosurv <- enrichGO(gene = entrez_surv, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pvalueCutoff = 0.05)
+
+# View results
+head(egosurv)
+
+# Plot results
+barplot(egosurv, showCategory = 10)
+dotplot(egosurv)
+```
+#survival KM by gene expression level
+```{r}
+library(lubridate)
+library(survminer)
+library(survival)
+survlm_ncounts <- counts(survlm, normalized = TRUE)
+survlm_ncounts=data.frame(t(survlm_ncounts[ressurvlm_df$log2FoldChange>0 & ressurvlm_df$significant=="Significant",]))
+survlm_ncounts$sigscore=rowMeans(survlm_ncounts)
+survlm_ncounts$sample=rownames(survlm_ncounts)
+survlm_ncounts$sigscore_bin=ifelse(survlm_ncounts$sigscore<median(survlm_ncounts$sigscore),"low","high")
+kmlm=merge(metacw,survlm_ncounts,by="sample")
+#kmlm$stat=ifelse(is.na(kmlm$dodlmdiff),0,1)
+#kmlm$kmtime=ifelse(is.na(kmlm$dodlmdiff),time_length(interval(kmlm$)),kmlm$dodlmdiff)
+
+# Fit Kaplan-Meier curves
+surv_object <- Surv(time = kmlm$ostime, event = kmlm$Deceased)
+km_fit <- survfit(surv_object ~ sigscore_bin, data = kmlm)
+
+# Plot Kaplan-Meier curves
+ggsurvplot(km_fit,
+           data = kmlm,
+           pval = TRUE,
+           conf.int = TRUE,
+           risk.table = TRUE,
+           ggtheme = theme_minimal(),
+           palette = c("#E7B800", "#2E9FDF"))
+```
