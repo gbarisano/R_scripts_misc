@@ -1,0 +1,582 @@
+
+```{r}
+# clear workspace variables
+rm(list = ls())
+# it means ctrl+L. clear window
+cat("\014")
+# close all plots
+graphics.off()
+library(archive)
+library(ggplot2)
+library(dplyr)
+library(openxlsx)
+library(DESeq2)
+library(vsn)
+library(pheatmap)
+library(EnhancedVolcano)
+library(Seurat)
+```
+#data download
+```{r}
+options(timeout = 300)
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE185063&format=file","GSE185063.tar", method = "auto")
+archive_extract("GSE185063.tar")
+allmat=lapply(list.files(pattern = ".h5"),function(x){
+  return(Read10X_h5(paste0(getwd(),"/",x),use.names = TRUE, unique.features = TRUE))
+  })
+
+download.file("https://cdn.rupress.org/rup/content_public/journal/jem/219/11/10.1084_jem.20221137/3/jem_20221137_tables1.xlsx?Expires=1740705884&Signature=yyWx4Nfb0tmKcIBjjJtZ-Rvusd79z3GvZKsbdqceqd8K4MDySdbBaOkD-VzTPwQ-3sUD4OtqXq90MXbNwDUD1UCAZ67Xjnqk6C5qz2tiynzg9-Lxi1v5THNoqprQYmP2KnLXkGxm4CRJ3pJZ9D1VG0COgrNla7DeZJx7Tnhoy16m0YA3QJ2uvBDVFL0v7lA-fnryLLGgd8h-Uua32rUiBZHH6e9CSS0FfoAdXKJGyoCl8CUI4LMiKZLoAt1CjVpkVb9b55XOtikLvmyTqagV9ylki1pN0e8E5PxqIT9uVgtnAOT2UHbo9SFgg7DcPT~mVqHjnRT3cboQHnqfl97N~w__&Key-Pair-Id=APKAIE5G5CRDK6RD3PGA","tables.xlsx", method = "auto")
+```
+
+#seurat processing + umap
+```{r}
+seurat_list <- lapply(allmat, function(mat) {
+  CreateSeuratObject(counts = mat)
+})
+seurat_obj <- merge(seurat_list[[1]], y = seurat_list[-1])
+
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize")
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj, vars.to.regress = "nCount_RNA")
+seurat_obj <- RunPCA(seurat_obj)
+seurat_obj <- FindNeighbors(seurat_obj,dims = 1:30)
+seurat_obj <- FindClusters(seurat_obj,resolution = 0.02)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10,umap.method = "uwot-learn")
+
+# Visualize
+DimPlot(seurat_obj, reduction = "umap")
+```
+
+#dot plot clusters
+```{r}
+genes <- c("APOE", "Pdgfrb", "Vtn", "Cldn5", "Pecam1", "Flt1", "Cspg4", "Vcan", 
+           "Pdgfra", "Inpp5d", "C1qa", "Csf1r", "Hexb", "Aqp4", "Gja1", "Slc1a3", 
+           "Slc1a2", "Mbp", "Pip1", "Gad2", "Gad1", "Satb2", "Slc17a7")
+#Create the Dot Plot
+DotPlot(seurat_obj, features = genes) + 
+  scale_color_gradient2(low = "white", high = "red", mid = "pink", midpoint = 1) + 
+  theme_minimal() + 
+  RotatedAxis()  # Rotate gene labels for readability
+```
+#pie chart clusters
+```{r}
+# Get the cluster assignments
+cluster_counts <- table(seurat_obj_filtered$seurat_clusters)
+
+# Convert to a data frame
+df <- as.data.frame(cluster_counts) %>% 
+  mutate(celltype=ifelse(Var1 %in% c(0,3,8,9),"Excitatory Neurons",ifelse(Var1 %in% c(1,5),"Inhibitory Neurons",ifelse(Var1==2,"OPC",ifelse(Var1==4,"Astrocytes",ifelse(Var1==6,"Vascular","Microglia"))))))%>%
+  group_by(celltype) %>% summarise(summ=sum(Freq))%>%
+  mutate(Percentage = summ / sum(summ) * 100)
+df$celltype=factor(df$celltype,levels=c("Excitatory Neurons","Inhibitory Neurons","OPC","Astrocytes","Vascular","Microglia"),labels=paste(df$celltype,))
+
+ggplot(df, aes(x = "", y = Percentage, fill = celltype)) +
+  geom_point()+
+  geom_bar(stat = "identity", width = 1, color = "black") +
+  coord_polar("y", start = 0) +  # Convert to pie chart
+  theme_void() +  # Remove unnecessary elements
+  theme(plot.title = element_text(hjust = 0.5))
+```
+```{r}
+# Find differentially expressed genes in vascular cluster compared to other clusters
+seurat_obj2 <- JoinLayers(seurat_obj)
+de_genes_cluster_6 <- FindMarkers(seurat_obj2, ident.1 = 6, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Optionally, you can filter genes by adjusted p-value and log fold change
+signature_genes <- rownames(de_genes_cluster_6[de_genes_cluster_6$p_val_adj < 0.05 & abs(de_genes_cluster_6$avg_log2FC) > 0.25, ])
+# Calculate the average expression of the signature genes for vascular cluster
+avg_expression_cluster_6 <- AverageExpression(seurat_obj2, features = signature_genes, assays = "RNA")
+# Plot heatmap for average expression of signature genes in vascular cluster
+DoHeatmap(seurat_obj2, features = signature_genes, group.by = "ident") +
+  scale_fill_gradient(low = "white", high = "red")
+```
+
+#DEGs volcano plots and barplots
+###endothelial cells - figure 1
+```{r}
+ec_e4e3y=read_excel("tables.xlsx",sheet = 1,skip = 3)
+ec_e4e3y$group="2-3 mo"
+ec_e4e3o=read_excel("tables.xlsx",sheet = 2,skip = 3)
+ec_e4e3o$group="9-12 mo"
+ec_e4e3=merge(ec_e4e3y,ec_e4e3o,all=T)
+ggplot(ec_e4e3, aes(x=avg_log2FC, y=(-1)*log10(p_val_adj), col=group)) + geom_point() + xlim(-2,2)+ theme_classic()+
+   scale_color_discrete()+ ggtitle("EC DEGs, E4F vs E3F",)+
+  theme(axis.text=element_text(size=18, color="black"),
+        axis.title=element_text(size=18),#face="bold"),
+        plot.title = element_text(size=18,face="bold",hjust = 0.5),
+        legend.text = element_text(size=18, color="black"),
+        legend.title = element_blank(),
+        legend.key.size = unit(2.5, "cm"),
+        legend.key.width = unit(0.5,"cm"))+
+  labs(x= expression ("log"[2]~("fold change")),y= expression ("-log (adjusted"~italic("P")~"value)"))
+
+ec_e4e3_long=merge(ec_e4e3o,ec_e4e3y,by="gene")
+ggplot(data=ec_e4e3_long, aes(x=avg_log2FC.x,y=avg_log2FC.y)) + geom_point() + xlim(-2,2) + ylim(-2,2) +theme_classic() + ggtitle("EC DEGs, E4F vs E3F") +
+        geom_vline(xintercept=c(0,0), col="blue",linetype="dashed") +
+        geom_hline(yintercept=c(0,0), col="blue",linetype="dashed")+
+  xlab("avg_log2FC_E4vsE3_old") + ylab("avg_log2FC_E4vsE3_young")+
+  theme(axis.text=element_text(size=18, color="black"),
+        axis.title=element_text(size=17),#face="bold"),
+        plot.title = element_text(size=18,face="bold",hjust = 0.5))+
+  labs(x= expression ("log"[2]~("fold change 9-12 mo")),y= expression ("log"[2]~("fold change 2-3 mo")))
+
+#barplots
+#2-3 mo
+df_E3_ec=data.frame(table(ec_e4e3y$`Functional Class`[ec_e4e3y$`Functional Class`!="Unknown"],ec_e4e3y$Direction[ec_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_ec$Class= paste(df_E3_ec$Var1," (",df_E3_ec$Freq,")",sep="")
+
+df_E3_ec$UP=df_E3_ec$Freq[df_E3_ec$Var2=="UP"]
+genes_sum=aggregate(df_E3_ec$Freq, list(df_E3_ec$Var1), FUN=sum)
+
+df_E3_ec$Var1=factor(df_E3_ec$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_ec, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("EC,"~italic("E4F")~"vs"~italic("E3F")~"2-3-mo"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(paste0("(",sum(df_E3_ec$Freq)," DEGs)"), x = 0.65, y = 0.92,size=18)
+
+
+#9-12 mo
+df_E3_ec=data.frame(table(ec_e4e3o$`Functional Class`[ec_e4e3o$`Functional Class`!="Unknown"],ec_e4e3o$Direction[ec_e4e3o$`Functional Class`!="Unknown"]))
+df_E3_ec$Class= paste(df_E3_ec$Var1," (",df_E3_ec$Freq,")",sep="")
+
+df_E3_ec$UP=df_E3_ec$Freq[df_E3_ec$Var2=="UP"]
+genes_sum=aggregate(df_E3_ec$Freq, list(df_E3_ec$Var1), FUN=sum)
+
+df_E3_ec$Var1=factor(df_E3_ec$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_ec, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("EC,"~italic("E4F")~"vs"~italic("E3F")~"9-12-mo"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(paste0("(",sum(df_E3_ec$Freq)," DEGs)"), x = 0.65, y = 0.92,size=18)
+
+#common
+df_E3_ec=data.frame(table(ec_e4e3_long$`Functional Class.y`[ec_e4e3_long$`Functional Class.y`!="Unknown"],ec_e4e3_long$Direction.y[ec_e4e3_long$`Functional Class.y`!="Unknown"]))
+df_E3_ec$Class= paste(df_E3_ec$Var1," (",df_E3_ec$Freq,")",sep="")
+
+df_E3_ec$UP=df_E3_ec$Freq[df_E3_ec$Var2=="UP"]
+genes_sum=aggregate(df_E3_ec$Freq, list(df_E3_ec$Var1), FUN=sum)
+
+df_E3_ec$Var1=factor(df_E3_ec$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_ec, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("EC,"~italic("E4F")~"vs"~italic("E3F")~", Common 2-3 and 9-12-mo"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(paste0("(",sum(df_E3_ec$Freq)," DEGs)"), x = 0.65, y = 0.92,size=18)
+```
+###pericytes - figure 2
+```{r}
+pc_e4e3y=read_excel("tables.xlsx",sheet = 5,skip = 3)
+pc_e4e3y$group="2-3 mo"
+pc_e4e3o=read_excel("tables.xlsx",sheet = 6,skip = 3)
+pc_e4e3o$group="9-12 mo"
+pc_e4e3=merge(pc_e4e3y,pc_e4e3o,all=T)
+ggplot(pc_e4e3, aes(x=avg_log2FC, y=(-1)*log10(p_val_adj), col=group)) + geom_point() + xlim(-2,2)+ theme_classic()+
+   scale_color_discrete()+ ggtitle("PC DEGs, E4F vs E3F",)+
+  theme(axis.text=element_text(size=18, color="black"),
+        axis.title=element_text(size=18),#face="bold"),
+        plot.title = element_text(size=18,face="bold",hjust = 0.5),
+        legend.text = element_text(size=18, color="black"),
+        legend.title = element_blank(),
+        legend.key.size = unit(2.5, "cm"),
+        legend.key.width = unit(0.5,"cm"))+
+  labs(x= expression ("log"[2]~("fold change")),y= expression ("-log (adjusted"~italic("P")~"value)"))
+
+pc_e4e3_long=merge(pc_e4e3o,pc_e4e3y,by="gene")
+ggplot(data=pc_e4e3_long, aes(x=avg_log2FC.x,y=avg_log2FC.y)) + geom_point() + xlim(-2,2) + ylim(-2,2) +theme_classic() + ggtitle("PC DEGs, E4F vs E3F") +
+        geom_vline(xintercept=c(0,0), col="blue",linetype="dashed") +
+        geom_hline(yintercept=c(0,0), col="blue",linetype="dashed")+
+  xlab("avg_log2FC_E4vsE3_old") + ylab("avg_log2FC_E4vsE3_young")+
+  theme(axis.text=element_text(size=18, color="black"),
+        axis.title=element_text(size=17),#face="bold"),
+        plot.title = element_text(size=18,face="bold",hjust = 0.5))+
+  labs(x= expression ("log"[2]~("fold change 9-12 mo")),y= expression ("log"[2]~("fold change 2-3 mo")))
+
+#barplots
+#2-3 mo
+df_E3_pc=data.frame(table(pc_e4e3y$`Functional Class`[pc_e4e3y$`Functional Class`!="Unknown"],pc_e4e3y$Direction[pc_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_pc$Class= paste(df_E3_pc$Var1," (",df_E3_pc$Freq,")",sep="")
+
+df_E3_pc$UP=df_E3_pc$Freq[df_E3_pc$Var2=="UP"]
+genes_sum=aggregate(df_E3_pc$Freq, list(df_E3_pc$Var1), FUN=sum)
+
+df_E3_pc$Var1=factor(df_E3_pc$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_pc, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("PC,"~italic("E4F")~"vs"~italic("E3F")~"2-3-mo"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(paste0("(",sum(df_E3_pc$Freq)," DEGs)"), x = 0.65, y = 0.92,size=18)
+
+
+#9-12 mo
+df_E3_pc=data.frame(table(pc_e4e3o$`Functional Class`[pc_e4e3o$`Functional Class`!="Unknown"],pc_e4e3o$Direction[pc_e4e3o$`Functional Class`!="Unknown"]))
+df_E3_pc$Class= paste(df_E3_pc$Var1," (",df_E3_pc$Freq,")",sep="")
+
+df_E3_pc$UP=df_E3_pc$Freq[df_E3_pc$Var2=="UP"]
+genes_sum=aggregate(df_E3_pc$Freq, list(df_E3_pc$Var1), FUN=sum)
+
+df_E3_pc$Var1=factor(df_E3_pc$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_pc, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("PC,"~italic("E4F")~"vs"~italic("E3F")~"9-12-mo"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(paste0("(",sum(df_E3_pc$Freq)," DEGs)"), x = 0.65, y = 0.92,size=18)
+```
+###excitatory and inhibitory neurons - figure 6
+```{r}
+en_e4e3y=read_excel("tables.xlsx",sheet = 17,skip = 1)
+
+df_E3_en=data.frame(table(en_e4e3y$`Functional Class`[en_e4e3y$`Functional Class`!="Unknown"],en_e4e3y$Direction[en_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_en$Class= paste(df_E3_en$Var1," (",df_E3_en$Freq,")",sep="")
+
+df_E3_en$UP=df_E3_en$Freq[df_E3_en$Var2=="UP"]
+genes_sum=aggregate(df_E3_en$Freq, list(df_E3_en$Var1), FUN=sum)
+
+df_E3_en$Var1=factor(df_E3_en$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_en, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("DEGs in Excitatory Neurons"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(("9-12- vs 2-3-month-old"), x = 0.65, y = 0.92,size=18)
+
+
+#9-12 mo
+in_e4e3y=read_excel("tables.xlsx",sheet = 18,skip = 1)
+
+df_E3_in=data.frame(table(in_e4e3y$`Functional Class`[in_e4e3y$`Functional Class`!="Unknown"],in_e4e3y$Direction[in_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_in$Class= paste(df_E3_in$Var1," (",df_E3_in$Freq,")",sep="")
+
+df_E3_in$UP=df_E3_in$Freq[df_E3_in$Var2=="UP"]
+genes_sum=aggregate(df_E3_in$Freq, list(df_E3_in$Var1), FUN=sum)
+
+df_E3_in$Var1=factor(df_E3_in$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_in, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("DEGs in Inhitatory Neurons"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(("9-12- vs 2-3-month-old"), x = 0.65, y = 0.92,size=18)
+```
+###astrocytes and microglia - figure 7 and 8
+```{r}
+as_e4e3y=read_excel("tables.xlsx",sheet = 19,skip = 1)
+
+df_E3_as=data.frame(table(as_e4e3y$`Functional Class`[as_e4e3y$`Functional Class`!="Unknown"],as_e4e3y$Direction[as_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_as$Class= paste(df_E3_as$Var1," (",df_E3_as$Freq,")",sep="")
+
+df_E3_as$UP=df_E3_as$Freq[df_E3_as$Var2=="UP"]
+genes_sum=aggregate(df_E3_as$Freq, list(df_E3_as$Var1), FUN=sum)
+
+df_E3_as$Var1=factor(df_E3_as$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_as, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("red","blue"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("DEGs in Astrocytes"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(("9-12- vs 2-3-month-old, E4F"), x = 0.65, y = 0.92,size=18)
+
+
+#9-12 mo
+mi_e4e3y=read_excel("tables.xlsx",sheet = 20,skip = 1)
+
+df_E3_mi=data.frame(table(mi_e4e3y$`Functional Class`[mi_e4e3y$`Functional Class`!="Unknown"],mi_e4e3y$Direction[mi_e4e3y$`Functional Class`!="Unknown"]))
+df_E3_mi$Class= paste(df_E3_mi$Var1," (",df_E3_mi$Freq,")",sep="")
+
+df_E3_mi$UP=df_E3_mi$Freq[df_E3_mi$Var2=="UP"]
+genes_sum=aggregate(df_E3_mi$Freq, list(df_E3_mi$Var1), FUN=sum)
+
+df_E3_mi$Var1=factor(df_E3_mi$Var1,levels=unique(genes_sum$Group.1[order(genes_sum$x)]))
+ggdraw(ggplot(df_E3_mi, aes(x=Var1,  y=Freq, fill=Var2)) +
+  geom_bar(position='stack',stat='identity',color="black") + xlab(NULL) + ylab("Frequency") +
+  coord_flip() + theme_bw() + theme(legend.position = "none")+
+  theme(axis.text.x = element_text(size = 14),axis.title.x = element_text(size=12)) +
+  scale_fill_manual(values=c("blue","red"))+
+    labs(title = "") + 
+    theme(plot.title = element_text(margin = margin(t = 8, r = 0, b = 0, l = 0,
+                                                  unit = "mm")))) +
+  draw_label(expression("DEGs in Microglia"), x = 0.65, y = 0.97,size = 18,fontface = "bold") +
+  draw_label(("9-12- vs 2-3-month-old, E4F"), x = 0.65, y = 0.92,size=18)
+```
+#Differentially phosphorilated proteins - Global (Figure 3)
+```{r}
+kinase=read_excel("tables.xlsx",sheet = 8,skip = 2)
+#stacked + percent plot
+kinase=kinase[!is.na(kinase$`Netphorest Kinase Family`) & kinase$`Netphorest Kinase Family`!="N/A",]
+kinase$`Netphorest Kinase Family`[kinase$`Netphorest Kinase Family`=="Atypical:PIKK"]="Atypical"
+kinase$`Netphorest Kinase Family`[kinase$`Netphorest Kinase Family`=="CMCG"]="CMGC"
+#kinase$`Netphorest Kinase Family`[kinase$`Netphorest Kinase Family`=="TLK"]="TK" ##TLK: Tousled-like kinases (TLK1 and TLK2) are nuclear serine/threonine kinases
+#kinase$`Netphorest Kinase Family`=factor(kinase$`Netphorest Kinase Family`, levels = rev(c("AGC","CMGC","STE","Atypical","TKL","TK","TLK")))
+kinase$`Netphorest Kinase Family`=factor(kinase$`Netphorest Kinase Family`, levels = rev(c("AGC","CMGC","STE","Atypical","TK","TKL","TLK")))
+
+kinase=kinase[kinase$`Functional Classification`!="Chaperone" & kinase$`Functional Classification`!="Receptor" & kinase$`Functional Classification`!="Other" & kinase$`Functional Classification`!="Motor Protein" & kinase$`Functional Classification`!="Motor Protein - GTP signaling" & kinase$`Functional Classification`!="Mitochondrial Function" & kinase$`Functional Classification`!="Metabolic Enzyme" & kinase$`Functional Classification`!="Intracellular Protein Transport - GTP Signaling" & kinase$`Functional Classification`!="GTP Signaling - Intracellular Protein Transport" & kinase$`Functional Classification`!="Growth Factor - DNA Binding" & kinase$`Functional Classification`!="Cytoskeletal Dynamics - Cell Adhesion" & kinase$`Functional Classification`!="Protein Kinase - Solute Transport" & kinase$`Functional Classification`!="Scaffold",]
+kinase$`Functional Classification`=factor(kinase$`Functional Classification`, levels = (c("Cytoskeletal Dynamics","RNA Binding","DNA Binding","Intracellular Protein Transport","Cell Adhesion","GTP Signaling","Protein Degradation","Solute Transport","Protein Kinase","Protein Phosphatase","Adaptor","Extracellular")))
+
+kinase2=as.data.frame(table(kinase$`Netphorest Kinase Family`,kinase$`Functional Classification`))
+
+table(kinase2$Var1)
+table(kinase2$Var2)
+
+
+ggplot(kinase2, aes(fill=Var1, y=Freq, x=Var2)) + 
+    geom_bar(position="fill", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("") + xlab(NULL) + labs(fill=""#,title="All regulated Phosphosites"
+                                                                                                                                  )+theme(axis.title=element_text(size=14),
+      axis.text.x=element_text(size=12,color="black",angle = 45,vjust = 0.3),
+      axis.text.y=element_text(size=12,color="black"),
+      plot.title = element_text(size=14, face="bold",hjust = 0.5))+
+  scale_fill_manual(values=rev(c("blue","orange","yellow","green","turquoise4","gray","red")))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA),labels = scales::percent) 
+```
+#Differentially phosphorilated proteins - EC vs PC (Figure 3)
+```{r}
+dep67=read_excel("tables.xlsx",sheet=10,skip = 3)
+dep67$gene.name=dep67$Protein
+dep67$`Cell Type Classification`=ifelse(dep67$`Cell Type Classification`=="astrocyte","AC",dep67$`Cell Type Classification`)
+dep67$`Netphorest Kinase Family`=ifelse(dep67$`Netphorest Kinase Family`=="Atypical:PIKK","Atypical",dep67$`Netphorest Kinase Family`)
+dep67$`Netphorest Kinase Family`=ifelse(dep67$`Netphorest Kinase Family`=="CMCG","CMGC",dep67$`Netphorest Kinase Family`)
+
+
+#stacked + percent plot
+df_all_phospho=as.data.frame(table(dep67$`Cell Type Classification`,dep67$`Netphorest Kinase Family`))
+df_all_phospho=df_all_phospho[(df_all_phospho$Var1=="Total" | df_all_phospho$Var1=="PC" | df_all_phospho$Var1=="EC"),] #only those clearly assigned to a cell type
+df_all_phospho=df_all_phospho[df_all_phospho$Var2!="N/A",]
+df_all_phospho$Var2=factor(df_all_phospho$Var2, levels = rev(c("AGC","CMGC","STE","Atypical","TK","TKL","TLK")))
+df_phospho_total=as.data.frame(table(dep67$`Netphorest Kinase Family`[dep67$`Netphorest Kinase Family`!="N/A"]))
+df_phospho_total$Var2=df_phospho_total$Var1
+df_phospho_total$Var1="Total"
+df_all_phospho=rbind(df_all_phospho,df_phospho_total)
+df_all_phospho$Var1=factor(df_all_phospho$Var1, levels = c("Total","EC","PC"))
+ggplot(df_all_phospho[df_all_phospho$Var1!="AC" & df_all_phospho$Var1!="Total",], aes(fill=Var2, y=Freq, x=Var1)) + 
+    geom_bar(position="fill", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Percent") + xlab(NULL) + labs(fill="",title="All regulated Phosphosites")+theme(axis.title=element_text(size=14),
+      axis.text.x=element_text(size=12,color="black"),
+      axis.text.y=element_text(size=12,color="black"),
+      plot.title = element_text(size=14, face="bold",hjust = 0.5))+
+  scale_fill_manual(values=rev(c("blue", "orange", "yellow","green","turquoise4","gray","red")))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA),labels = scales::percent) 
+
+#stacked + percent plot cytosk
+df_cyto_phospho=as.data.frame(table(dep67$`Cell Type Classification`[dep67$Localization=="Cytoskeleton"],dep67$`Netphorest Kinase Family`[dep67$Localization=="Cytoskeleton"]))
+df_cyto_phospho=df_cyto_phospho[(df_cyto_phospho$Var1=="Total" | df_cyto_phospho$Var1=="PC" | df_cyto_phospho$Var1=="EC"),] #only those clearly assigned to a cell type
+df_cyto_phospho=df_cyto_phospho[df_cyto_phospho$Var2!="N/A",]
+df_cyto_phospho$Var2=factor(df_cyto_phospho$Var2, levels = rev(c("AGC","CMGC","STE")))
+
+df_phospho_cyto_total=as.data.frame(table(dep67$`Netphorest Kinase Family`[dep67$`Netphorest Kinase Family`!="N/A" & dep67$Localization=="Cytoskeleton"]))
+df_phospho_cyto_total$Var2=df_phospho_cyto_total$Var1
+df_phospho_cyto_total$Var1="Total"
+df_cyto_phospho=rbind(df_cyto_phospho,df_phospho_cyto_total)
+df_cyto_phospho$Var1=factor(df_cyto_phospho$Var1, levels = c("Total","EC","PC"))
+ggplot(df_cyto_phospho[df_cyto_phospho$Var1!="AC" & df_cyto_phospho$Var1!="Total",], aes(fill=Var2, y=Freq, x=Var1)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Cytoskeletal Phosphosites")+theme(axis.title=element_text(size=14),
+      axis.text.x=element_text(size=12,color="black"),
+      axis.text.y=element_text(size=12,color="black"),
+      plot.title = element_text(size=14, face="bold",hjust = 0.5))+
+  scale_fill_manual(values=rev(c("blue", "orange", "yellow")))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 40))
+
+#stacked + percent plot nucleus
+df_nucleus_phospho=as.data.frame(table(dep67$`Cell Type Classification`[dep67$Localization=="Nucleus"],dep67$`Netphorest Kinase Family`[dep67$Localization=="Nucleus"]))
+df_nucleus_phospho=df_nucleus_phospho[(df_nucleus_phospho$Var1=="Total" | df_nucleus_phospho$Var1=="PC" | df_nucleus_phospho$Var1=="EC"),] #only those clearly assigned to a cell type
+df_nucleus_phospho=df_nucleus_phospho[df_nucleus_phospho$Var2!="N/A",]
+df_nucleus_phospho$Var2=factor(df_nucleus_phospho$Var2, levels = rev(c("AGC","CMGC","Atypical","TKL")))
+
+df_phospho_nucleus_total=as.data.frame(table(dep67$`Netphorest Kinase Family`[dep67$`Netphorest Kinase Family`!="N/A" & dep67$Localization=="Nucleus"]))
+df_phospho_nucleus_total$Var2=df_phospho_nucleus_total$Var1
+df_phospho_nucleus_total$Var1="Total"
+df_nucleus_phospho=rbind(df_nucleus_phospho,df_phospho_nucleus_total)
+df_nucleus_phospho$Var1=factor(df_nucleus_phospho$Var1, levels = c("Total","EC","PC"))
+ggplot(df_nucleus_phospho[df_nucleus_phospho$Var1!="AC" & df_nucleus_phospho$Var1!="Total",], aes(fill=Var2, y=Freq, x=Var1)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Nuclear Phosphosites")+theme(axis.title=element_text(size=14),
+      axis.text.x=element_text(size=12,color="black"),
+      axis.text.y=element_text(size=12,color="black"),
+      plot.title = element_text(size=14, face="bold",hjust = 0.5))+
+  scale_fill_manual(values=rev(c("blue", "orange", "green","gray")))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 60)) 
+```
+```{r}
+library(pheatmap)
+zscores=as.matrix(dep67[,c("PC - Z-Score","EC - Z-Score")])
+colnames(zscores)=c("PC","EC")
+pheatmap(zscores,cluster_cols = F)
+```
+
+#Differentially expressed proteins - Global
+```{r}
+depall=read_excel("tables.xlsx",sheet = 12,skip = 2)
+depall$level=ifelse(depall$`Average Log2 Fold Change`<0,"DOWN","UP")
+depall$level=factor(depall$level, levels=c("UP","DOWN"))
+table(depall$`Functional Classification`)
+depall=depall[depall$`Functional Classification`=="Metabolic Enzyme" | depall$`Functional Classification`=="DNA Binding" | depall$`Functional Classification`=="RNA Binding" | depall$`Functional Classification`=="Cytoskeletal Protein" | depall$`Functional Classification`=="Solute Transporter" | depall$`Functional Classification`=="Cell Adhesion" | depall$`Functional Classification`=="Intracellular Protein Transport" | depall$`Functional Classification`=="GTP Signaling" | depall$`Functional Classification`=="Protein Kinase" | depall$`Functional Classification`=="Exocytosis" | depall$`Functional Classification`=="Adapter" | depall$`Functional Classification`=="ECM" | depall$`Functional Classification`=="Protein Phosphatase" | depall$`Functional Classification`=="Other",]
+depall$`Functional Classification`=factor(depall$`Functional Classification`, levels = (c("Metabolic Enzyme","DNA Binding","RNA Binding","Cytoskeletal Protein","Solute Transporter","Cell Adhesion","Intracellular Protein Transport","GTP Signaling","Protein Kinase","Exocytosis","Adapter","ECM","Protein Phosphatase","Other")))
+
+
+depall2=as.data.frame(table(depall$level,depall$`Functional Classification`))
+
+
+ggplot(depall2, aes(fill=Var1, y=Freq, x=Var2)) + 
+    geom_bar(position="fill", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("") + xlab(NULL) + labs(fill=""#,title="All regulated Phosphosites"
+                                                                                                                                  )+theme(axis.title=element_text(size=14),
+      axis.text.x=element_text(size=12,color="black",angle = 45,vjust = 0.3),
+      axis.text.y=element_text(size=12,color="black"),
+      plot.title = element_text(size=14, face="bold",hjust = 0.5))+
+  scale_fill_manual(values=(c("red","blue")))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA),labels = scales::percent) 
+```
+
+#Differentially expressed proteins - EC vs PC
+```{r}
+dep=read_excel("tables.xlsx",sheet = 13,skip = 2)
+dep$change=ifelse(dep$`Average Log2 Fold Change`>0,"Increased","Decreased")
+#table(dep$`Functional Classification`)
+dep_tot=as.data.frame(table(dep$`Functional Classification`,dep$change))
+dep_tot$Var3="Total"
+dep_cell=as.data.frame(table(dep$`Functional Classification`,dep$change,dep$`Cell Type Classification`))
+dep_cell=dep_cell[dep_cell$Var3=="Total" | dep_cell$Var3=="PC" | dep_cell$Var3=="EC",]
+dep_tot=rbind(dep_tot,dep_cell)
+dep_tot$Var2=factor(dep_tot$Var2, levels = c("Increased","Decreased"))
+dep_tot$Var3=factor(dep_tot$Var3, levels = c("Total","EC","PC"))
+
+p1=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Cytoskeletal Protein",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Cytoskeletal Dynamics")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p2=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Cell Adhesion",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Cell Adhesion")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+p3=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="DNA Binding",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="DNA Binding")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p4=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="RNA Binding",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="RNA Binding")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p5=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Solute Transporter",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Solute Transporter")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p6=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Intracellular Protein Transport",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Intracell. Protein Transport")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p7=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Metabolic Enzyme",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Metabolic Enzyme")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p8=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="GTP Signaling",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="GTP Signaling")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+
+p9=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Protein Kinase",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Protein Kinase")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+p10=ggplot(dep_tot[dep_tot$Var3!="AC" & dep_tot$Var3!="Total" & dep_tot$Var1=="Protein Phosphatase",], aes(fill=Var2, y=Freq, x=Var3)) + 
+    geom_bar(position="stack", stat="identity",width = 0.75,color="black") + theme_classic() + ylab("Count") + xlab(NULL) + labs(fill="",title="Protein Phospatase")+theme(axis.title=element_text(size=10),
+      axis.text.x=element_text(size=10,color="black"),
+      axis.text.y=element_text(size=10,color="black"),
+      plot.title = element_text(size=10, face="bold",hjust = 0.5),legend.position = "none")+
+  scale_fill_manual(values=c("red", "blue"))+
+  #scale_x_continuous(expand = c(0, 0), limits = c(0, NA)) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 15))
+
+
+ggarrange(p1, p2,p3,p4,p5,p6,p7,p8,p9,p10,nrow = 2,ncol = 5)
+```
+
