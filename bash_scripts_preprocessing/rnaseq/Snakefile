@@ -1,0 +1,87 @@
+import datetime
+import sys
+import os
+import pandas as pd
+import json
+
+timestamp = ('{:%Y-%m-%d_%H:%M:%S}'.format(datetime.datetime.now()))
+
+configfile:"omic_config.yaml"
+project_id = config["project_id"]
+
+SAMPLES, = glob_wildcards("samples/raw/{sample}_R1.fq")
+print(SAMPLES)
+
+#removed the index col for our metadata no longer needed it
+sample_id = config["sample_id"]
+md = pd.read_table(config["omic_meta_data"], index_col = sample_id, dtype=str)
+condition = config["linear_model"]
+
+# TO FILTER 
+
+
+# Wildcard function to grab proper condition
+ext = ['r','R1.pdf','R2.pdf','xls']
+fastq_ext = ['R1','R2']
+fastqscreen_ext = ['html','png','txt']
+insertion_and_clipping_prof_ext = ['r','R1.pdf','R2.pdf','xls']
+inner_distance_ext = ['_freq.txt','_plot.pdf','_plot.r','.txt']
+read_dist_ext = ['txt']
+read_gc_ext = ['.xls','_plot.r','_plot.pdf']
+
+
+with open('cluster.json') as json_file:
+    json_dict = json.load(json_file)
+
+rule_dirs = list(json_dict.keys())
+
+for rule in rule_dirs:
+    if not os.path.exists(os.path.join(os.getcwd(),'logs',rule)):
+        log_out = os.path.join(os.getcwd(), 'logs', rule)
+        os.makedirs(log_out)
+        print(log_out)
+
+
+result_dirs = ['diffexp','tables']
+for rule in result_dirs:
+    if not os.path.exists(os.path.join(os.getcwd(),'results',rule)):
+        log_out = os.path.join(os.getcwd(), 'results', rule)
+        os.makedirs(log_out)
+        print(log_out)
+
+def message(mes):
+    sys.stderr.write("|--- " + mes + "\n")
+
+
+for sample in SAMPLES:
+    message("Sample " + sample + " will be processed")
+
+print(SAMPLES)
+
+
+rule all:
+    input:
+        expand("results/tables/{project_id}_STAR_mapping_statistics.txt", project_id = config['project_id']),
+	expand("samples/fastqc/{sample}/{sample}_{fastq_ext}_t_fastqc.zip", sample = SAMPLES, fastq_ext = fastq_ext),
+        expand("samples/fastqscreen/{sample}/{sample}_{fastq_ext}_t_screen.{fastqscreen_ext}", sample=SAMPLES, fastq_ext=fastq_ext, fastqscreen_ext=fastqscreen_ext),
+	"data/{project_id}_counts_w_stats.txt".format(project_id=config['project_id']),
+        "data/{project_id}_counts.txt".format(project_id=config['project_id']),
+        "data/{project_id}_exon_counts.txt".format(project_id = config["project_id"]),
+   	expand("rseqc/insertion_profile/{sample}/{sample}.insertion_profile.{ext}",sample=SAMPLES, ext=insertion_and_clipping_prof_ext),
+        expand("rseqc/inner_distance/{sample}/{sample}.inner_distance{ext}", sample = SAMPLES, ext = inner_distance_ext),
+        expand("rseqc/clipping_profile/{sample}/{sample}.clipping_profile.{ext}", sample = SAMPLES, ext = insertion_and_clipping_prof_ext),
+        expand("rseqc/read_distribution/{sample}/{sample}.read_distribution.{ext}", sample = SAMPLES, ext = read_dist_ext),
+        expand("rseqc/read_GC/{sample}/{sample}.GC{ext}", sample = SAMPLES, ext = read_gc_ext),
+        "results/tables/read_coverage.txt",
+         expand("{project_id}_QC/Exon.Fraction.pdf", project_id=config["project_id"]),
+         expand("{project_id}_QC/Input.Reads.Barplot.pdf", project_id=config["project_id"]),
+         expand("{project_id}_QC/Unique.Reads.Barplot.pdf", project_id=config["project_id"]),
+         expand("{project_id}_QC/Scatter.Plot.LibSize.ExonFraction.pdf", project_id=config["project_id"]),
+         expand("{project_id}_QC/{project_id}_Metadata_W_QC_Metrics.txt", project_id=config["project_id"]),
+         expand("{project_id}_QC/{project_id}_PCA_potential_batch_grid.pdf", project_id=config["project_id"]),
+         expand("{project_id}_QC/{project_id}_subset_counts_RPM.txt", project_id=config["project_id"]),
+         expand("{project_id}_QC/{project_id}_subset_counts_pass.txt", project_id=config["project_id"]),
+include: "rules/align_rmdp.smk"
+include: "rules/omic_qc.smk"
+include: "rules/QC_init.smk"
+
